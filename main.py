@@ -1,14 +1,17 @@
 import re
 import time
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from collections import defaultdict, deque
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
+from astrbot.api.provider import ProviderRequest
 
 @register("emoji_like", "pppopipupu", "允许bot在napcat平台使用QQ表情反应消息。", "1.0.0")
 class EmojiReactionLike(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._msg_id_cache = defaultdict(lambda: deque(maxlen=50))
 
     def _parse_emoji_id(self, emoji_input: str) -> str:
         emoji_input = emoji_input.strip()
@@ -130,6 +133,22 @@ class EmojiReactionLike(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
         """自动表情反应监听器"""
+        if self.config.get("llm_react_enabled", False) and self.config.get("enable_msg_id_prefix", True):
+            group_id = str(event.message_obj.group_id or "private")
+            sender_name = ""
+            if hasattr(event.message_obj, 'sender'):
+                sender_name = event.message_obj.sender.nickname
+            ts = getattr(event.message_obj, 'timestamp', None)
+            if ts:
+                time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            else:
+                time_str = time.strftime("%H:%M:%S", time.localtime())
+            self._msg_id_cache[group_id].append((
+                str(event.message_obj.message_id),
+                sender_name,
+                time_str
+            ))
+
         if not self.config.get("auto_react", False):
             return
 
@@ -171,46 +190,23 @@ class EmojiReactionLike(Star):
                     await self._do_emoji_reaction(event, message_id, parsed_id)
 
     @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req):
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """在LLM请求前为历史消息注入msg_id"""
-        logger.info(f"on_llm_request: req type is {type(req)}")
         if not self.config.get("llm_react_enabled", False) or not self.config.get("enable_msg_id_prefix", True):
             return
         if event.get_platform_name() != "aiocqhttp":
             return
 
-        group_id = event.message_obj.group_id
-        if not group_id:
-            return
-
-        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-        if not isinstance(event, AiocqhttpMessageEvent):
-            return
-
-        try:
-            max_history = self.context.get_config().get("max_history", 150)
-            history = await event.bot.api.call_action('get_group_msg_history', group_id=int(group_id), count=max_history)
-            messages = history.get('messages', []) if isinstance(history, dict) else []
-        except Exception as e:
-            logger.error(f"get_group_msg_history failed: {e}")
+        group_id = str(event.message_obj.group_id or "private")
+        cache = list(self._msg_id_cache.get(group_id, []))
+        if not cache:
             return
 
         cache_lookup = {}
-        for msg in messages:
-            mid = str(msg.get('message_id', ''))
-            sender = msg.get('sender', {})
-            nick = sender.get('nickname', '').strip()
-            card = sender.get('card', '').strip()
-            msg_time = msg.get('time', 0)
-            if msg_time:
-                local_t = time.localtime(msg_time)
-                seconds = local_t.tm_hour * 3600 + local_t.tm_min * 60 + local_t.tm_sec
-                
-                for name in (nick, card):
-                    if name:
-                        if name not in cache_lookup:
-                            cache_lookup[name] = []
-                        cache_lookup[name].append((seconds, mid))
+        for mid, sender, ts in cache:
+            key = (sender, ts)
+            cache_lookup[key] = mid
+            logger.info(f"Cache entry: {key} -> {mid}")
 
         current_mid = str(event.message_obj.message_id)
 
@@ -218,25 +214,9 @@ class EmojiReactionLike(Star):
             def replacer(m):
                 sender = m.group(1).strip()
                 time_str = m.group(2)
-                
-                try:
-                    h, min_, s = map(int, time_str.split(':'))
-                    req_seconds = h * 3600 + min_ * 60 + s
-                except ValueError:
-                    return m.group(0)
-
-                if sender in cache_lookup:
-                    closest_mid = None
-                    min_diff = 60
-                    for cached_sec, mid in cache_lookup[sender]:
-                        diff = abs(cached_sec - req_seconds)
-                        if diff > 12 * 3600:
-                            diff = 24 * 3600 - diff
-                        if diff < min_diff:
-                            min_diff = diff
-                            closest_mid = mid
-                    if closest_mid:
-                        return f"msg_id:{closest_mid} {m.group(0)}"
+                key = (sender, time_str)
+                if key in cache_lookup:
+                    return f"msg_id:{cache_lookup[key]} {m.group(0)}"
                 return m.group(0)
             text = re.sub(r'\[([^/]+)/(\d{2}:\d{2}:\d{2})\]:', replacer, text)
             text = re.sub(
@@ -245,56 +225,67 @@ class EmojiReactionLike(Star):
                 text
             )
             return text
-        
-        if hasattr(req, 'prompt') and req.prompt:
-            req.prompt = inject_msg_ids(req.prompt)
-        elif hasattr(req, 'messages') and req.messages:
-            last_msg = req.messages[-1]
-            if hasattr(last_msg, 'content') and isinstance(last_msg.content, str):
-                last_msg.content = inject_msg_ids(last_msg.content)
 
-    @filter.on_decorating_result()
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """拦截即将发送的消息，提取并执行表情反应标记"""
+        req.prompt = inject_msg_ids(req.prompt)
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """拦截LLM输出，正则匹配表情反应标记并一次性处理"""
         if not self.config.get("llm_react_enabled", False):
             return
 
         if event.get_platform_name() != "aiocqhttp":
             return
 
-        result = event.get_result()
-        if not result or not hasattr(result, "chain") or not result.chain:
+        resp_text = getattr(resp, 'completion_text', None) or ""
+        if not resp_text:
             return
 
         current_message_id = event.message_obj.message_id
+
         targeted_pattern = self.config.get("llm_react_targeted_regex", r"\[react:([^\],]+),id:([^\]]+)\]")
+        try:
+            targeted_matches = re.findall(targeted_pattern, resp_text)
+        except re.error as e:
+            logger.error(f"Invalid regex for targeted LLM react: {e}")
+            targeted_matches = []
+
+        for emoji_raw, target_id in targeted_matches:
+            emoji_id = self._parse_emoji_id(emoji_raw.strip())
+            await self._do_emoji_reaction(event, target_id.strip(), emoji_id)
+            logger.info(f"LLM react (targeted): emoji_id={emoji_id} on message_id={target_id.strip()}")
+
+        resp_text = re.sub(targeted_pattern, "", resp_text)
+
         simple_pattern = self.config.get("llm_react_regex", r"\[react:([^\]]+)\]")
+        if simple_pattern:
+            try:
+                simple_matches = re.findall(simple_pattern, resp_text)
+            except re.error as e:
+                logger.error(f"Invalid regex for simple LLM react: {e}")
+                simple_matches = []
 
-        from astrbot.api.message_components import Plain
+            for match in simple_matches:
+                emoji_id = self._parse_emoji_id(match.strip())
+                await self._do_emoji_reaction(event, current_message_id, emoji_id)
+                logger.info(f"LLM react (simple): emoji_id={emoji_id} on message_id={current_message_id}")
 
-        for comp in result.chain:
-            if isinstance(comp, Plain) and comp.text:
-                original_text = comp.text
-                
-                try:
-                    targeted_matches = re.findall(targeted_pattern, original_text)
-                    for emoji_raw, target_id in targeted_matches:
-                        emoji_id = self._parse_emoji_id(emoji_raw.strip())
-                        await self._do_emoji_reaction(event, target_id.strip(), emoji_id)
-                        logger.info(f"LLM react (targeted): emoji_id={emoji_id} on message_id={target_id.strip()}")
-                    original_text = re.sub(targeted_pattern, "", original_text)
-                except re.error as e:
-                    logger.error(f"Invalid regex for targeted LLM react: {e}")
+            resp_text = re.sub(simple_pattern, "", resp_text)
 
-                if simple_pattern:
-                    try:
-                        simple_matches = re.findall(simple_pattern, original_text)
-                        for match in simple_matches:
-                            emoji_id = self._parse_emoji_id(match.strip())
-                            await self._do_emoji_reaction(event, current_message_id, emoji_id)
-                            logger.info(f"LLM react (simple): emoji_id={emoji_id} on message_id={current_message_id}")
-                        original_text = re.sub(simple_pattern, "", original_text)
-                    except re.error as e:
-                        logger.error(f"Invalid regex for simple LLM react: {e}")
+        cleaned_text = resp_text.strip()
+        if hasattr(resp, 'completion_text'):
+            resp.completion_text = cleaned_text
 
-                comp.text = original_text
+    @filter.llm_tool()
+    async def emoji_reaction_tool(self, event: AstrMessageEvent, message_id: str, emoji_id: str):
+        """对一条消息进行表态。
+
+        Args:
+            message_id(string): 目标消息的msg_id
+            emoji_id(string): 表情ID，可以是数字ID或者直接的emoji字符
+        """
+        if event.get_platform_name() != "aiocqhttp":
+            yield {"status": "error", "msg": "platform_not_supported"}
+        parsed_id = self._parse_emoji_id(emoji_id)
+        ret = await self._do_emoji_reaction(event, message_id, parsed_id)
+        yield ret
