@@ -2,9 +2,6 @@ name: Release Plugin
 
 on:
   push:
-    branches:
-      - main
-      - master
 
 jobs:
   build-and-release:
