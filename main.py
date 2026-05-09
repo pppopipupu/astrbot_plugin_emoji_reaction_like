@@ -1,8 +1,10 @@
 import re
+import time
 from collections import defaultdict, deque
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
+from astrbot.api.provider import ProviderRequest
 
 @register("emoji_like", "pppopipupu", "允许bot在napcat平台使用QQ表情反应消息。", "1.0.0")
 class EmojiReactionLike(Star):
@@ -119,10 +121,26 @@ class EmojiReactionLike(Star):
             f"自动反应: {self.config.get('auto_react', False)}\n"
             f"反应范围: {self.config.get('react_scope', 'all')}\n"
             f"反应规则:\n{rules_text}"
-            f"LLM函数工具: {self.config.get('llm_react_enabled', False)}\n"
-            f"消息ID前缀: {self.config.get('enable_msg_id_prefix', True)}\n"
+            f"LLM输出反应: {self.config.get('llm_react_enabled', False)}\n"
+            f"消息ID参考表: {self.config.get('enable_msg_id_prefix', True)}\n"
+            f"简单反应正则: {self.config.get('llm_react_regex', '')}\n"
+            f"指定目标正则: {self.config.get('llm_react_targeted_regex', '')}\n"
             "\n请在 AstrBot WebUI 中修改配置。"
         )
+        yield event.plain_result(text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("cache")
+    async def cache(self, event: AstrMessageEvent):
+        """显示当前消息ID缓存（调试用）"""
+        group_id = str(event.message_obj.group_id or "private")
+        cache = list(self._msg_id_cache.get(group_id, []))
+        if not cache:
+            yield event.plain_result("当前消息ID缓存为空")
+            return
+        text = "当前消息ID缓存:\n"
+        for mid, sender, ts, msg_str in cache:
+            text += f"  msg_id: {mid}, sender: {sender}, time: {ts}, message: {msg_str}\n"
         yield event.plain_result(text)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -132,13 +150,18 @@ class EmojiReactionLike(Star):
         if self.config.get("llm_react_enabled", False) and self.config.get("enable_msg_id_prefix", True):
             group_id = str(event.message_obj.group_id or "private")
             sender_name = ""
-            if hasattr(event.message_obj, 'sender') and isinstance(event.message_obj.sender, dict):
-                sender_name = event.message_obj.sender.get("nickname", "")
-            content_preview = (event.message_str or "")[:50]
+            if hasattr(event.message_obj, 'sender'):
+                sender_name = event.message_obj.sender.nickname
+            ts = getattr(event.message_obj, 'timestamp', None)
+            if ts:
+                time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            else:
+                time_str = time.strftime("%H:%M:%S", time.localtime())
             self._msg_id_cache[group_id].append((
                 str(event.message_obj.message_id),
                 sender_name,
-                content_preview
+                time_str,
+                event.message_str
             ))
 
         if not self.config.get("auto_react", False):
@@ -182,62 +205,86 @@ class EmojiReactionLike(Star):
                     await self._do_emoji_reaction(event, message_id, parsed_id)
 
     @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent, req):
-        """在LLM请求前注入msg_id参考表"""
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """在LLM请求前为历史消息注入msg_id"""
         if not self.config.get("llm_react_enabled", False) or not self.config.get("enable_msg_id_prefix", True):
             return
         if event.get_platform_name() != "aiocqhttp":
             return
 
         group_id = str(event.message_obj.group_id or "private")
-        cache = list(self._msg_id_cache.get(group_id, []))
+        cache = list(self._msg_id_cache.get(group_id, []))[-self.config.get("msg_id_cache_size", 10):]
+        if not cache:
+            return
 
-        ref_block = ""
-        if cache:
-            ref_lines = []
-            for mid, sender, preview in cache:
-                ref_lines.append(f"msg_id:{mid} [{sender}]: {preview}")
-            ref_block = "[msg_id参考表]\n" + "\n".join(ref_lines) + "\n[/msg_id参考表]\n"
+        prompt_addon = []
+        for mid, sender, ts, msg_str in cache:
+            if not mid.isdigit():
+                continue
+            prefix = f"msg_id:{mid}, sender:{sender}, time:{ts}, message:{msg_str}"
+            prompt_addon.append(prefix)
 
-        if hasattr(req, 'prompt') and req.prompt:
-            req.prompt = ref_block + req.prompt
-        elif hasattr(req, 'messages') and req.messages:
-            last_msg = req.messages[-1]
-            if hasattr(last_msg, 'content') and isinstance(last_msg.content, str):
-                last_msg.content = ref_block + last_msg.content
+        req.prompt = req.prompt.replace("Now, a new message is coming:", f"Now, a new message is coming (msg_id: {event.message_obj.message_id}):")
+        req.prompt += f"The previous message list is as follows. You can get the msg_id from it: {prompt_addon}"
 
-    def _tool_result_msg(self, ret):
-        if ret["status"] == "ok":
-            return "成功。不要再调用反应工具，直接回复用户。"
-        elif ret["status"] == "duplicate":
-            return "该表情已存在，无需重复添加。不要再调用反应工具，直接回复用户。"
-        else:
-            return f"失败({ret['msg']})。不要再调用反应工具，直接回复用户。"
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """拦截LLM输出，正则匹配表情反应标记并一次性处理"""
+        if not self.config.get("llm_react_enabled", False):
+            return
 
-    @filter.llm_tool(name="react_to_current_message")
-    async def react_to_current_message(self, event: AstrMessageEvent, emoji_id: str):
-        '''对用户当前发送的消息添加表情反应。每条消息每种表情只需调用一次，不要重复调用。
-        Args:
-            emoji_id(string): 表情ID。QQ原生表情使用数字如448代表火球术、447代表点赞、446代表摧心术、445代表魅惑怪物、444代表666、443代表死亡一指、442代表鸽子跳舞，也可以使用Unicode emoji字符。
-        '''
         if event.get_platform_name() != "aiocqhttp":
-            return "平台不支持。不要再调用反应工具，直接回复用户。"
+            return
+
+        resp_text = getattr(resp, 'completion_text', None) or ""
+        if not resp_text:
+            return
 
         current_message_id = event.message_obj.message_id
-        parsed_id = self._parse_emoji_id(emoji_id)
-        ret = await self._do_emoji_reaction(event, current_message_id, parsed_id)
-        return self._tool_result_msg(ret)
 
-    @filter.llm_tool(name="react_to_message")
-    async def react_to_message(self, event: AstrMessageEvent, emoji_id: str, message_id: str):
-        '''对指定消息ID的消息添加表情反应。每条消息每种表情只需调用一次，不要重复调用。
+        targeted_pattern = self.config.get("llm_react_targeted_regex", r"\[react:([^\],]+),id:([^\]]+)\]")
+        try:
+            targeted_matches = re.findall(targeted_pattern, resp_text)
+        except re.error as e:
+            logger.error(f"Invalid regex for targeted LLM react: {e}")
+            targeted_matches = []
+
+        for emoji_raw, target_id in targeted_matches:
+            emoji_id = self._parse_emoji_id(emoji_raw.strip())
+            await self._do_emoji_reaction(event, target_id.strip(), emoji_id)
+            logger.info(f"LLM react (targeted): emoji_id={emoji_id} on message_id={target_id.strip()}")
+
+        resp_text = re.sub(targeted_pattern, "", resp_text)
+
+        simple_pattern = self.config.get("llm_react_regex", r"\[react:([^\]]+)\]")
+        if simple_pattern:
+            try:
+                simple_matches = re.findall(simple_pattern, resp_text)
+            except re.error as e:
+                logger.error(f"Invalid regex for simple LLM react: {e}")
+                simple_matches = []
+
+            for match in simple_matches:
+                emoji_id = self._parse_emoji_id(match.strip())
+                await self._do_emoji_reaction(event, current_message_id, emoji_id)
+                logger.info(f"LLM react (simple): emoji_id={emoji_id} on message_id={current_message_id}")
+
+            resp_text = re.sub(simple_pattern, "", resp_text)
+
+        cleaned_text = resp_text.strip()
+        if hasattr(resp, 'completion_text'):
+            resp.completion_text = cleaned_text
+
+    @filter.llm_tool()
+    async def emoji_reaction_tool(self, event: AstrMessageEvent, message_id: str, emoji_id: str):
+        """对一条消息进行表态。当用户要求你“点个表态”或给一条消息“点赞”等时，调用此工具。注意：此工具与发表情包的工具不同。
+
         Args:
-            emoji_id(string): 表情ID。QQ原生表情使用数字如448代表火球术、447代表点赞、446代表摧心术、445代表魅惑怪物、444代表666、443代表死亡一指、442代表鸽子跳舞，也可以使用Unicode emoji字符。
-            message_id(string): 目标消息的ID，从消息的msg_id参考表中获取。
-        '''
+            message_id(string): 目标消息的msg_id，注意不是用户的User ID
+            emoji_id(string): 表情ID，可以是数字ID或者直接的emoji字符
+        """
         if event.get_platform_name() != "aiocqhttp":
-            return "平台不支持。不要再调用反应工具，直接回复用户。"
-
+            yield {"status": "error", "msg": "platform_not_supported"}
         parsed_id = self._parse_emoji_id(emoji_id)
-        ret = await self._do_emoji_reaction(event, message_id.strip(), parsed_id)
-        return self._tool_result_msg(ret)
+        ret = await self._do_emoji_reaction(event, message_id, parsed_id)
+        yield ret

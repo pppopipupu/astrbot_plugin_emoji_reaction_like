@@ -37,15 +37,33 @@
         "hint": "all=所有消息, group=仅群聊, private=仅私聊"
     },
     "llm_react_enabled": {
-        "description": "是否启用 LLM 表情反应函数工具",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，LLM 可通过函数工具调用 react_to_current_message 和 react_to_message 来添加表情反应"
-    },
-    "enable_msg_id_prefix": {
-        "description": "是否为消息注入消息 ID 前缀",
+        "description": "是否启用 LLM 输出表情反应",
         "type": "bool",
         "default": true,
-        "hint": "开启后，会在用户消息前添加 msg_id:xxx 前缀，以便 LLM 获取消息 ID 来调用 react_to_message 工具"
+        "hint": "开启后，LLM 在回复中使用 [react:表情ID] 或 [react:表情ID,id:消息ID] 标记来添加表情反应"
+    },
+    "enable_msg_id_prefix": {
+        "description": "是否注入消息 ID 参考表",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，会在 LLM 请求前注入近期消息的 msg_id 参考表，以便 LLM 使用 [react:表情ID,id:消息ID] 指定反应目标"
+    },
+    "llm_react_regex": {
+        "description": "LLM 简单反应正则",
+        "type": "string",
+        "default": "\\[react:([^\\]]+)\\]",
+        "hint": "匹配 LLM 输出中的简单反应标记，反应当前消息"
+    },
+    "llm_react_targeted_regex": {
+        "description": "LLM 指定目标反应正则",
+        "type": "string",
+        "default": "\\[react:([^\\],]+),id:([^\\]]+)\\]",
+        "hint": "匹配 LLM 输出中的指定目标反应标记，反应指定消息"
+    },
+    "msg_id_cache_size": {
+        "description": "消息 ID 缓存大小",
+        "type": "int",
+        "default": 10,
+        "hint": "用于注入到 LLM 请求中的消息 ID 参考表的最大缓存数量，建议根据实际情况调整，过大可能导致性能问题"
     }
 }
