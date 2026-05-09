@@ -1,0 +1,38 @@
+name: Release Plugin
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-and-release:
+    if: contains(github.event.head_commit.message, '[release]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Get Version
+        id: get_version
+        run: |
+          VERSION=$(grep '^version:' metadata.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Package Plugin
+        run: |
+          mkdir -p emoji_reaction_like
+          rsync -av --exclude='emoji_reaction_like' --exclude='.git' --exclude='.github' ./ emoji_reaction_like/
+          zip -r emoji_reaction_like.zip emoji_reaction_like/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          files: emoji_reaction_like.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
