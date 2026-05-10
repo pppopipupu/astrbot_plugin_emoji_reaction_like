@@ -1,7 +1,7 @@
 name: emoji_like
 display_name: EmojiReactionLike
 desc: 允许bot在napcat平台回复消息时添加表态（aka 反应 表情），支持正则触发及通过消息ID指定目标添加表情，可开关是否自动在消息前添加消息id。
-version: v1.1.0
+version: v1.1.1
 author: pppopipupu
 repo: https://github.com/pppopipupu/astrbot_plugin_emoji_reaction_like
 support_platforms:

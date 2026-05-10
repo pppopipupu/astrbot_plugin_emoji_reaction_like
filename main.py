@@ -11,7 +11,7 @@ class EmojiReactionLike(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._msg_id_cache = defaultdict(lambda: deque(maxlen=50))
+        self._msg_id_cache = defaultdict(lambda: deque(maxlen=self.config.get("msg_id_cache_size", 10)))
 
     def _parse_emoji_id(self, emoji_input: str) -> str:
         emoji_input = emoji_input.strip()
@@ -216,7 +216,7 @@ class EmojiReactionLike(Star):
             return
 
         group_id = str(event.message_obj.group_id or "private")
-        cache = list(self._msg_id_cache.get(group_id, []))[-self.config.get("msg_id_cache_size", 10):]
+        cache = self._msg_id_cache.get(group_id, [])
         if not cache:
             return
 
