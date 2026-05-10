@@ -157,12 +157,15 @@ class EmojiReactionLike(Star):
                 time_str = time.strftime("%H:%M:%S", time.localtime(ts))
             else:
                 time_str = time.strftime("%H:%M:%S", time.localtime())
-            self._msg_id_cache[group_id].append((
-                str(event.message_obj.message_id),
-                sender_name,
-                time_str,
-                event.message_str
-            ))
+            
+            msg_id_str = str(event.message_obj.message_id)
+            if event.message_str.strip() or msg_id_str.isdigit():
+                self._msg_id_cache[group_id].append((
+                    msg_id_str,
+                    sender_name,
+                    time_str,
+                    event.message_str
+                ))
 
         if not self.config.get("auto_react", False):
             return
